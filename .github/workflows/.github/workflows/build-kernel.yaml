@@ -1,0 +1,262 @@
+name: Build Samsung A13VE Kernel (4.19 arm64)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-latest
+
+    # Pin container for compatibility / reproducibility
+    container:
+      image: ubuntu:20.04
+
+    # (Kept from my existing workflow for compatibility with older node in container)
+    env:
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+
+    # Repo layout: this repo's root is now the PARENT folder containing
+    # both the kernel source and the vendor connectivity module source as
+    # siblings:
+    #   <repo root>/android_kernel_samsung_a13ve_mt6768-master/   (kernel)
+    #   <repo root>/vendor/mediatek/kernel_modules/                (connectivity, udc)
+    # This matches drivers/misc/mediatek/connectivity/Makefile, which
+    # locates the vendor source via $(srctree)/.. -- so every `make`
+    # invocation below needs to run from inside the kernel subfolder, not
+    # the repo root. `defaults.run.working-directory` does that for every
+    # `run:` step; `uses:` steps (checkout, upload-artifact) are
+    # unaffected by it and are pathed explicitly where needed.
+    defaults:
+      run:
+        working-directory: kernel
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Verify vendor connectivity source is present
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -d "../vendor/mediatek/kernel_modules/connectivity" ]; then
+            echo "ERROR: ../vendor/mediatek/kernel_modules/connectivity not found."
+            echo "This repo is expected to contain both:"
+            echo "  android_kernel_samsung_a13ve_mt6768-master/  (this checkout)"
+            echo "  vendor/                                       (sibling, committed alongside it)"
+            echo "If vendor/ isn't committed to this repo, add a checkout/download"
+            echo "step before this one that places it at that path."
+            exit 1
+          fi
+          echo "OK: vendor connectivity source found."
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            bc bison flex build-essential clang llvm lld \
+            git wget curl ca-certificates \
+            libssl-dev libncurses5-dev \
+            python3 \
+            rsync unzip xz-utils \
+            libelf-dev \
+            file
+
+      - name: Fetch LineageOS prebuilt clang (kernel, r416183b)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth=1 \
+            https://github.com/LineageOS/android_prebuilts_clang_kernel_linux-x86_clang-r416183b \
+            /opt/clang-prebuilt
+
+          # Locate clang and tool prefix robustly (repo layout may vary)
+          CLANG_BIN="$(find /opt/clang-prebuilt -type f -path '*/bin/clang' -print -quit)"
+          if [ -z "${CLANG_BIN}" ]; then
+            echo "ERROR: clang not found under /opt/clang-prebuilt"
+            find /opt/clang-prebuilt -maxdepth 4 -type f -name clang -print || true
+            exit 1
+          fi
+
+          TOOLBIN="$(dirname "${CLANG_BIN}")"
+          echo "TOOLBIN=${TOOLBIN}" >> "${GITHUB_ENV}"
+
+          # Prefer aarch64-linux-gnu- if present (per Samsung note style)
+          if [ -x "${TOOLBIN}/aarch64-linux-gnu-gcc" ] || [ -x "${TOOLBIN}/aarch64-linux-gnu-ld" ]; then
+            echo "CROSS_PREFIX=${TOOLBIN}/aarch64-linux-gnu-" >> "${GITHUB_ENV}"
+            echo "CLANG_TRIPLE_PREFIX=${TOOLBIN}/aarch64-linux-gnu-" >> "${GITHUB_ENV}"
+          else
+            # Fallback: use llvm toolchain only; many trees are fine with LLVM=1
+            echo "CROSS_PREFIX=" >> "${GITHUB_ENV}"
+            echo "CLANG_TRIPLE_PREFIX=" >> "${GITHUB_ENV}"
+          fi
+
+          echo "CLANG_BIN=${CLANG_BIN}" >> "${GITHUB_ENV}"
+
+      - name: Sanity check toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${CLANG_BIN}" --version | head -n 1
+          echo "TOOLBIN=${TOOLBIN}"
+          ls -la "${TOOLBIN}" | head -n 50
+          if [ -n "${CROSS_PREFIX}" ]; then
+            "${CROSS_PREFIX}gcc" -dumpmachine || true
+            "${CROSS_PREFIX}ld" --version | head -n 1 || true
+          fi
+
+      - name: Configure (a13ve_defconfig)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p out
+
+          export ARCH=arm64
+          export ANDROID_MAJOR_VERSION=r
+
+          # Avoid editing Makefile: pass toolchain via env/args
+          export CC="${CLANG_BIN}"
+          export KCFLAGS="-w"
+
+          # If GNU prefix exists, set it; else rely on LLVM
+          if [ -n "${CROSS_PREFIX}" ]; then
+            export CROSS_COMPILE="${CROSS_PREFIX}"
+            export CLANG_TRIPLE="${CLANG_TRIPLE_PREFIX}"
+            # Keep LLVM helpers enabled; harmless and improves portability
+            export LLVM=1
+            export LLVM_IAS=1
+          else
+            export LLVM=1
+            export LLVM_IAS=1
+          fi
+
+          make -C "$(pwd)" O="$(pwd)/out" \
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y \
+            a13ve_defconfig droidspaces.config
+
+          # Resolve any dependency selections without prompting
+          make -C "$(pwd)" O="$(pwd)/out" olddefconfig
+
+      - name: Build kernel + modules
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          export ARCH=arm64
+          export ANDROID_MAJOR_VERSION=r
+          export CC="${CLANG_BIN}"
+          export KCFLAGS="-w"
+
+          if [ -n "${CROSS_PREFIX}" ]; then
+            export CROSS_COMPILE="${CROSS_PREFIX}"
+            export CLANG_TRIPLE="${CLANG_TRIPLE_PREFIX}"
+            export LLVM=1
+            export LLVM_IAS=1
+          else
+            export LLVM=1
+            export LLVM_IAS=1
+          fi
+
+          make -C "$(pwd)" O="$(pwd)/out" \
+            CONFIG_SECTION_MISMATCH_WARN_ONLY=y \
+            -j"$(nproc)"
+
+      - name: Build external connectivity modules (bt/gps/fmradio/connfem/udc)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # UNVERIFIED / never run: this step was never actually executed
+          # against a real toolchain when written -- validate it before
+          # relying on it. See build_kernel.sh for the same logic with
+          # fuller comments on where each variable value came from.
+          #
+          # Vendor source is expected as a sibling of this checkout (see
+          # the "Verify vendor connectivity source is present" step above),
+          # i.e. at "$(pwd)/../vendor/mediatek/kernel_modules".
+
+          VENDOR_CONN="$(pwd)/../vendor/mediatek/kernel_modules/connectivity"
+          VENDOR_UDC="$(pwd)/../vendor/mediatek/kernel_modules/udc"
+          # (existence of VENDOR_CONN is already guaranteed by the
+          # "Verify vendor connectivity source is present" step, which
+          # fails the job earlier if it's missing)
+
+          export ARCH=arm64
+          export CC="${CLANG_BIN}"
+          export KCFLAGS="-w"
+          if [ -n "${CROSS_PREFIX}" ]; then
+            export CROSS_COMPILE="${CROSS_PREFIX}"
+            export LLVM=1
+            export LLVM_IAS=1
+          else
+            export LLVM=1
+            export LLVM_IAS=1
+          fi
+
+          mkdir -p out_ext_modules
+
+          build_ext_module() {
+            local moddir="$1"; shift
+            if [ ! -d "$moddir" ]; then
+              echo "WARNING: $moddir not found, skipping"
+              return
+            fi
+            make -C "$(pwd)" O="$(pwd)/out" ARCH=arm64 CROSS_COMPILE="${CROSS_COMPILE:-}" \
+              M="$moddir" KERNEL_OUT="$(pwd)/out" "$@" modules
+            find "$moddir" -maxdepth 1 -name '*.ko' -exec cp -v {} out_ext_modules/ \;
+          }
+
+          build_ext_module "$VENDOR_CONN/bt/mt66xx/wmt" BT_PLATFORM=connac1x
+          build_ext_module "$VENDOR_CONN/gps"
+          build_ext_module "$VENDOR_CONN/connfem"
+          build_ext_module "$VENDOR_CONN/fmradio" MODULE_NAME=fmradio_drv_mt6631
+          build_ext_module "$VENDOR_UDC"
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          # Kernel image
+          if [ -f out/arch/arm64/boot/Image.gz ]; then
+            cp -v out/arch/arm64/boot/Image.gz artifacts/
+          else
+            echo "ERROR: out/arch/arm64/boot/Image.gz not found"
+            find out/arch/arm64/boot -maxdepth 2 -type f -print || true
+            exit 1
+          fi
+
+          # Modules
+          find out -type f -name "*.ko" -print > artifacts/modules.list || true
+          if [ -s artifacts/modules.list ]; then
+            mkdir -p artifacts/modules
+            while IFS= read -r ko; do
+              rel="${ko#out/}"
+              mkdir -p "artifacts/modules/$(dirname "${rel}")"
+              cp -v "${ko}" "artifacts/modules/${rel}"
+            done < artifacts/modules.list
+            (cd artifacts && tar -czf modules.tar.gz modules)
+          else
+            echo "WARNING: No .ko modules found under out/"
+          fi
+
+          # Save resolved config for debugging
+          cp -v out/.config artifacts/kernel.config
+
+          # External connectivity modules (bt/gps/fmradio/connfem/udc), if built
+          if [ -d out_ext_modules ] && [ -n "$(ls -A out_ext_modules 2>/dev/null)" ]; then
+            mkdir -p artifacts/ext_modules
+            cp -v out_ext_modules/*.ko artifacts/ext_modules/
+            (cd artifacts && tar -czf ext_modules.tar.gz ext_modules)
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: a13ve-kernel-4.19-arm64
+          path: android_kernel_samsung_a13ve_mt6768-master/artifacts
